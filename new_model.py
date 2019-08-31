@@ -19,17 +19,6 @@ data = np.load('JPmarket_dataset.npz')
 train_vols = data['train_volumes']
 test_vols = data['test_volumes']
 
-#need to change this to create windows for all stocks 
-def split_data(n_days, data): #data for one stock in the form [days, bins]
-  no_ts = data.shape[0]-n_days
-  length_ts = n_days*data.shape[1]
-  new_data = np.zeros((no_ts,length_ts))
-  for j in range(no_ts):
-    for i in range(n_days): 
-      new_data[j,64*i:64*i + 64] = data[j+i,:]
-  
-  return new_data
-
 def getbd_from_theta(theta): 
   gamma, beta, delta = theta
   L = len(beta)
@@ -132,6 +121,13 @@ def init_weights(m):
         nn.init.xavier_uniform_(m.weight_ih_l0.data)
         nn.init.xavier_uniform_(m.weight_hh_l0.data)
 
+def binary_vector(output_pos,T): 
+    out = torch.zeros((T,T))
+    for j in range(1,T+1): 
+        if output_pos+T-j <= T:
+            out[j-1,output_pos+T-j-1] = 1
+    return out 
+
 class Encoder(nn.Module):
     def __init__(self, input_size, enc_hidden_size, batch_size, num_layers, encoder_len):
         super().__init__()
@@ -154,13 +150,14 @@ class Encoder(nn.Module):
         return encoder_out, encoder_hidden
 
 class Attn_Decoder(nn.Module): 
-    def __init__(self, input_size, dec_hidden_size, enc_hidden_size, batch_size, num_layers):
+    def __init__(self, input_size, dec_hidden_size, enc_hidden_size, batch_size, num_layers, T_enc):
         super().__init__()
         self.input_size = input_size
         self.enc_size = enc_hidden_size
         self.dec_size = dec_hidden_size
         self.batch_size = batch_size
         self.num_layers = num_layers
+        self.T_enc = T_enc
         
         self.lstm = nn.LSTM(input_size = self.input_size + self.dec_size, hidden_size = self.dec_size, num_layers = self.num_layers)
         self.linear = nn.Linear(self.dec_size, self.dec_size)
@@ -174,9 +171,13 @@ class Attn_Decoder(nn.Module):
         self.dense = nn.Linear(self.dec_size, 1)
         
         #for the attention mechanism 
-        self.W = nn.Linear(self.enc_size, self.dec_size)
-        self.U = nn.Linear(self.enc_size, self.dec_size)
-        self.V = nn.Linear(self.enc_size, 1)
+        self.W = nn.Linear(self.enc_size, self.dec_size, bias = False)
+        self.U = nn.Linear(self.enc_size, self.dec_size, bias = False)
+        self.V = nn.Linear(self.enc_size, 1, bias = False)
+        
+        #new attention weight
+        self.pi = nn.Parameter(torch.FloatTensor(self.T_enc))
+        nn.init.normal_(self.pi)
         
         #initializaton
         self.lstm.apply(init_weights)
@@ -189,9 +190,27 @@ class Attn_Decoder(nn.Module):
         self.U.apply(init_weights)
         self.V.apply(init_weights)
         
-    def forward(self, data, hidden, enc_output, return_attn = False): 
+    def forward(self, data, hidden, enc_output, i, return_attn = False): 
+        #reminder: this is for one output time step so attention weight is of 
         enc_output = enc_output.permute(1,0,2)
-        attn_score = self.V(self.tanh(self.W(enc_output) + self.U(hidden[0][0].view(1,1,-1))))
+        output_pos = i+1
+        j_null = output_pos
+        delta = binary_vector(output_pos,self.T_enc)
+        prod = torch.zeros((self.T_enc))
+        for k in range(self.T_enc): 
+            dot = torch.dot(self.pi, delta[k])
+            prod[k] = dot
+        
+        u_h = self.U(enc_output)
+        
+        for n in range(u_h.shape[2]): 
+            u_h[0,:,n] *= prod
+            
+        
+        attn_score = self.V(self.tanh(self.W(hidden[0][0].view(1,1,-1)) + u_h))
+        
+        attn_score[0,:j_null,0] = 0 
+        
         attn_weights = self.softmax(attn_score, dim=1)
         
         context_vector = torch.sum(attn_weights * enc_output, dim=1)
@@ -213,10 +232,9 @@ class Attn_Decoder(nn.Module):
         
         if return_attn: 
             return theta, dec_hidden, attn_weights
-    
-        return theta, dec_hidden
-        
-        
+        else: 
+            return theta, dec_hidden
+      
 learning_rate = 0.001
 #learning_rate_decay = 
 num_epochs = 500
@@ -255,7 +273,7 @@ covars_test_data = new_create_covariate_data(new_test_data, 64, [0,31,32,63])
 covars_test_data = torch.FloatTensor(covars_test_data)
 
 encoder = Encoder(6, enc_hidden_units, batch_size, num_lstm_layers, T_encoder-1)
-decoder = Attn_Decoder(6, dec_hidden_units, enc_hidden_units, batch_size, num_lstm_layers)
+decoder = Attn_Decoder(6, dec_hidden_units, enc_hidden_units, batch_size, num_lstm_layers, T_encoder-1)
 
 loss_function = crps_loss
 optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr= learning_rate)
@@ -288,7 +306,7 @@ for i in range(num_epochs):
     dec_data = data_batch[j, -(T_decoder+1):]
     
     for t in range(T_decoder):             
-      theta, decoder_hidden = decoder(dec_data[t:t+1], decoder_hidden, encoder_output)
+      theta, decoder_hidden = decoder(dec_data[t:t+1], decoder_hidden, encoder_output, t)
       loss_t += loss_function(theta, dec_data[t+1:t+2,0])
    
     batch_loss += loss_t
@@ -314,7 +332,7 @@ for i in range(num_epochs):
               dec_test_data = test_data_batch[k, -(T_decoder+1):]
               
               for t in range(T_decoder): 
-                  theta, decoder_hidden = decoder(dec_test_data[t:t+1], decoder_hidden, encoder_output)
+                  theta, decoder_hidden = decoder(dec_test_data[t:t+1], decoder_hidden, encoder_output, t)
                   test_loss_t += loss_function(theta, dec_test_data[t+1:t+2,0])
               
               test_batch_loss += test_loss_t
@@ -334,16 +352,11 @@ for i in range(num_epochs):
   torch.cuda.empty_cache()  
   
       
-#np.savez('new_model_train_loss', train_loss)
-#np.savez('new_model_test_loss', test_loss)
+np.savez('new_model_train_loss', train_loss)
+np.savez('new_model_test_loss', test_loss)
 
 
 test_vol = test_vols[0:number_series].reshape((number_series,-1))
-
-#norm_test_vols = np.zeros(test_vol.shape)
-#for i in range(number_series): 
-#  norm_test_vols[i] = test_vol[i]/np.amax(test_vols[i])
-
 
 num_test_windows = 10
   
@@ -383,7 +396,7 @@ with torch.no_grad():
                 sample_path = np.zeros(pred_length)
     
                 for i in range(pred_length): 
-                    theta, decoder_hidden, attn_weights = decoder(decoder_input.view(1,-1), decoder_hidden, encoder_output, return_attn = True)
+                    theta, decoder_hidden, attn_weights = decoder(decoder_input.view(1,-1), decoder_hidden, encoder_output, i, return_attn = True)
                     saved_attn_weights[i] += attn_weights.view(-1)
                     count += 1
                     alpha = torch.distributions.uniform.Uniform(0,1).rsample()
@@ -410,16 +423,4 @@ with torch.no_grad():
 av_attn_weights = saved_attn_weights/count
 attn_weights = av_attn_weights.numpy()
 
-#np.savez('test_series', norm_test_windows)
-#np.savez('attn_weights', attn_weights)
-#np.savez('new_model_paths', paths)
-#mean_paths = np.mean(paths[0], axis=0)
-#median_paths = np.median(paths[0], axis=0)
 
-#plt.plot(paths[0][6][-128:])
-#plt.plot(new_test_data[0][-128:])
-#plt.plot(median_paths[-128:])
-#plt.plot(mean_paths[-128:])
-
-#for i in range(paths.shape[1]): 
-#plt.plot(paths[0][i][-128:])
